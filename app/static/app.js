@@ -65,7 +65,36 @@ function onReady() {
 
   renderZones();
   fillForm(defaults);
+  applyCalibratedCoefficients();
   loadSnapshots();
+}
+
+// If the calibration page just sent us here, its coefficients are waiting in
+// localStorage; write them into the form (never touching saved snapshots or
+// diagnoses) and clear the slot.
+function applyCalibratedCoefficients() {
+  let raw;
+  try {
+    raw = localStorage.getItem("calibratedCoefficients");
+    if (!raw) return;
+    localStorage.removeItem("calibratedCoefficients");
+  } catch (error) {
+    return;
+  }
+  let coefficients;
+  try {
+    coefficients = JSON.parse(raw);
+  } catch (error) {
+    return;
+  }
+  if (!Array.isArray(coefficients) || coefficients.length !== 2) return;
+  document.querySelectorAll(".zone-card").forEach((card, zoneIndex) => {
+    const pair = coefficients[zoneIndex];
+    if (!Array.isArray(pair) || pair.length !== 2) return;
+    card.querySelector('[data-field="coefficient-0"]').value = pair[0];
+    card.querySelector('[data-field="coefficient-1"]').value = pair[1];
+  });
+  showToast("已将校准系数填入表单（未改动任何旧快照或诊断）");
 }
 
 function renderZones() {

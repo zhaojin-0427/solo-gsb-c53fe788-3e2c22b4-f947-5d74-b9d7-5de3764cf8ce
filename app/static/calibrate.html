@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>实测响应系数校准 · 双区烘箱曲线试算</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <h1>实测响应系数校准</h1>
+      <p>跨快照共用系数对 · 序列归属联合裁决 · 精确有理数最小二乘</p>
+    </div>
+    <div class="header-actions">
+      <a class="nav-link" href="/">返回试算页</a>
+      <button id="calibrateBtn" type="button">开始校准</button>
+    </div>
+  </header>
+
+  <main class="layout calibrate-layout">
+    <section class="panel">
+      <div class="section-heading">
+        <h2>1. 选择快照</h2>
+        <span>至少两条已找到曲线的不同快照；无解或未找到曲线的快照不可选</span>
+      </div>
+      <div id="snapshotPicker" class="snapshot-picker"></div>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <h2>2. 录入实测温度序列</h2>
+        <span>每快照每温区两条未标号序列，归属由校准裁决</span>
+      </div>
+      <p class="muted">
+        分钟限第 1 分钟至该快照末分钟，可跳过部分分钟，每条序列至少一个读数；温度为 0～300℃ 的有限十进制数。
+        预测温度由各快照保存的设定曲线与初温按原精确递推重新计算，不取当前表单，也不复用旧系数的展示轨迹。
+      </p>
+      <div id="entryPanels"></div>
+      <p id="entryHint" class="muted">请先在上方勾选快照。</p>
+    </section>
+
+    <section id="calibrationPanel" class="panel result-panel" hidden>
+      <div class="result-header">
+        <div>
+          <h2>校准结果</h2>
+          <span id="calibBadge" class="badge"></span>
+        </div>
+        <div id="calibMeta" class="solve-meta"></div>
+      </div>
+      <p id="calibMessage" class="result-message"></p>
+      <div class="diagnose-actions">
+        <button id="applyBtn" type="button">将系数填回试算表单</button>
+      </div>
+      <div id="calibBody"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/calibrate.js"></script>
+</body>
+</html>

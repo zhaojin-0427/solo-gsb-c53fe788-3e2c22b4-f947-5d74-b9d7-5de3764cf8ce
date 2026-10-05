@@ -7,7 +7,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP, getcontext
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, getcontext
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple
@@ -1437,6 +1437,325 @@ def restore_request(request_json: Optional[str]) -> SolveRequest:
         )
 
 
+# ---------- Measured-response coefficient calibration ----------
+#
+# Calibration predicts temperatures only from each selected snapshot's saved
+# setpoint curve and saved initial temperatures, re-propagating every
+# candidate coefficient through the exact rational recurrence; it never reads
+# the current form and never reuses the old-coefficient display trajectories.
+# Each zone's two coefficients form an unordered pair on the 0.01..1.00 grid
+# (step 0.01), shared across all selected snapshots. For every candidate pair
+# the attribution of the two unlabeled measured series of every snapshot/zone
+# is decided jointly with the pair by exact rational least squares; fitting
+# the series one by one and stitching the results would give a different
+# (wrong) answer, and no error is ever rounded to page precision before
+# comparison.
+CALIBRATE_MAX_SNAPSHOTS = 10
+TIED_PAIRS_PREVIEW = 50
+COEFFICIENT_GRID: List[Fraction] = [Fraction(k, 100) for k in range(1, 101)]
+
+
+def coefficient_text(grid_index: int) -> str:
+    """Format a grid coefficient (1..100 -> 0.01..1.00) with two decimals."""
+    return f"{grid_index // 100}.{grid_index % 100:02d}"
+
+
+class ReadingInput(BaseModel):
+    minute: int
+    temperature: Decimal
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def parse_temperature(cls, value: Any) -> Decimal:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+            raise ValueError("实测温度必须是 0～300℃ 的有限十进制数")
+        try:
+            # Floats go through str() so binary artifacts never leak in.
+            parsed = Decimal(str(value)) if isinstance(value, float) else Decimal(value)
+        except (InvalidOperation, ValueError):
+            raise ValueError("实测温度必须是 0～300℃ 的有限十进制数")
+        return parsed
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("实测温度必须是有限十进制数")
+        if value < 0 or value > 300:
+            raise ValueError("实测温度必须位于 0 到 300℃ 之间")
+        return value
+
+
+class ZoneMeasurements(BaseModel):
+    series: List[List[ReadingInput]] = Field(min_length=2, max_length=2)
+
+
+class SnapshotMeasurements(BaseModel):
+    snapshot_id: int = Field(ge=1)
+    zones: List[ZoneMeasurements] = Field(min_length=2, max_length=2)
+
+
+class CalibrateRequest(BaseModel):
+    snapshots: List[SnapshotMeasurements] = Field(
+        min_length=2, max_length=CALIBRATE_MAX_SNAPSHOTS
+    )
+
+
+class CalibrationFailure(Exception):
+    """Raised for calibration input problems that must be reported clearly."""
+
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
+def load_snapshot_curve(snapshot_id: int) -> Tuple[List[int], SolveRequest]:
+    """Return (setpoints, saved request) for a snapshot that has a curve."""
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            "SELECT status, request_json, result_json FROM snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+    if row is None:
+        raise CalibrationFailure(404, "snapshot_not_found", f"快照 #{snapshot_id} 不存在。")
+    status, request_json, result_json = row
+    try:
+        result = json.loads(result_json)
+    except (ValueError, TypeError):
+        result = {}
+    setpoints = result.get("setpoints")
+    if (
+        status not in ("optimal", "feasible_not_optimal")
+        or not isinstance(setpoints, list)
+        or not setpoints
+        or any(not isinstance(value, int) for value in setpoints)
+    ):
+        raise CalibrationFailure(
+            400,
+            "no_curve",
+            f"快照 #{snapshot_id} 没有已找到的设定曲线（状态：{result.get('status_text', status)}），不能用于校准。",
+        )
+    try:
+        request = SolveRequest.model_validate(json.loads(request_json))
+    except (ValueError, ValidationError, TypeError) as exc:
+        raise CalibrationFailure(
+            400, "missing_input", f"快照 #{snapshot_id} 保存的输入缺失或无法解析：{exc}"
+        )
+    if len(setpoints) != request.duration:
+        raise CalibrationFailure(
+            400,
+            "curve_mismatch",
+            f"快照 #{snapshot_id} 保存的曲线长度与试算时长不一致，不能用于校准。",
+        )
+    return setpoints, request
+
+
+def predict_temperatures(
+    setpoints: List[int], initial: Fraction, alpha: Fraction
+) -> List[Fraction]:
+    """Exact rational recurrence T(t+1) = T(t) + alpha * (U(t+1) - T(t))."""
+    temperatures = [initial]
+    for setpoint in setpoints:
+        previous = temperatures[-1]
+        temperatures.append(previous + alpha * (Fraction(setpoint) - previous))
+    return temperatures
+
+
+def calibrate_zone(zone_index: int, snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Exact joint least-squares fit of one zone's unordered coefficient pair.
+
+    For every unordered pair {alpha1, alpha2} on the 0.01..1.00 grid the two
+    unlabeled series of each selected snapshot are attributed to the two
+    coefficients in whichever order gives the smaller exact squared-error sum
+    for that snapshot; the pair minimizing the total over every reading of
+    every selected snapshot wins. Distinct pairs tied at the exact minimum
+    make the zone unidentifiable.
+    """
+    prepared: List[Dict[str, Any]] = []
+    for data in snapshots:
+        trajectories = [
+            predict_temperatures(data["setpoints"], data["initial"], alpha)
+            for alpha in COEFFICIENT_GRID
+        ]
+        sse_by_series: List[List[Fraction]] = []
+        for readings in data["series"]:
+            sse_by_alpha: List[Fraction] = []
+            for temperatures in trajectories:
+                total = Fraction(0)
+                for minute, measured in readings:
+                    difference = measured - temperatures[minute]
+                    total += difference * difference
+                sse_by_alpha.append(total)
+            sse_by_series.append(sse_by_alpha)
+        prepared.append(
+            {"data": data, "trajectories": trajectories, "sse": sse_by_series}
+        )
+
+    best_sse: Optional[Fraction] = None
+    best_pairs: List[Tuple[int, int]] = []
+    for first in range(len(COEFFICIENT_GRID)):
+        for second in range(first, len(COEFFICIENT_GRID)):
+            total = Fraction(0)
+            for entry in prepared:
+                sse_first_series, sse_second_series = entry["sse"]
+                direct = sse_first_series[first] + sse_second_series[second]
+                swapped = sse_first_series[second] + sse_second_series[first]
+                total += direct if direct <= swapped else swapped
+            if best_sse is None or total < best_sse:
+                best_sse = total
+                best_pairs = [(first, second)]
+            elif total == best_sse:
+                best_pairs.append((first, second))
+
+    payload: Dict[str, Any] = {
+        "zone_index": zone_index + 1,
+        "zone_name": snapshots[0]["zone_name"],
+        "sse": rational_payload(best_sse),
+        "tied_count": len(best_pairs),
+        "status": "unique" if len(best_pairs) == 1 else "tied",
+    }
+    if len(best_pairs) != 1:
+        payload["tied_pairs"] = [
+            [coefficient_text(first + 1), coefficient_text(second + 1)]
+            for first, second in best_pairs[:TIED_PAIRS_PREVIEW]
+        ]
+        return payload
+
+    first, second = best_pairs[0]
+    payload["coefficients"] = [
+        coefficient_text(first + 1),
+        coefficient_text(second + 1),
+    ]
+    assignments: List[Dict[str, Any]] = []
+    for entry in prepared:
+        data = entry["data"]
+        sse_first_series, sse_second_series = entry["sse"]
+        direct = sse_first_series[first] + sse_second_series[second]
+        swapped = sse_first_series[second] + sse_second_series[first]
+        tie = direct == swapped
+        if direct <= swapped:
+            chosen = (first, second)
+            chosen_sse = direct
+        else:
+            chosen = (second, first)
+            chosen_sse = swapped
+        series_payloads: List[Dict[str, Any]] = []
+        for series_index, (readings, coefficient) in enumerate(
+            zip(data["series"], chosen), start=1
+        ):
+            temperatures = entry["trajectories"][coefficient]
+            reading_payloads = [
+                {
+                    "minute": minute,
+                    "measured": rational_payload(measured),
+                    "predicted": rational_payload(temperatures[minute]),
+                    "residual": rational_payload(measured - temperatures[minute]),
+                }
+                for minute, measured in readings
+            ]
+            series_payloads.append(
+                {
+                    "series": series_index,
+                    "coefficient": coefficient_text(coefficient + 1),
+                    "sse": rational_payload(entry["sse"][series_index - 1][coefficient]),
+                    "readings": reading_payloads,
+                }
+            )
+        assignments.append(
+            {
+                "snapshot_id": data["snapshot_id"],
+                "zone_name": data["zone_name"],
+                "tie": tie,
+                "sse": rational_payload(chosen_sse),
+                "series": series_payloads,
+            }
+        )
+    payload["assignments"] = assignments
+    return payload
+
+
+def run_calibration(request: CalibrateRequest, started: float) -> Dict[str, Any]:
+    snapshot_ids = [item.snapshot_id for item in request.snapshots]
+    if len(set(snapshot_ids)) != len(snapshot_ids):
+        raise CalibrationFailure(
+            400,
+            "duplicate_snapshot",
+            "所选快照存在重复：校准需要至少两条不同的已找到曲线的快照。",
+        )
+
+    # Per zone, one entry per selected snapshot; the coefficient pair of a
+    # zone is shared across all of them.
+    zone_snapshots: List[List[Dict[str, Any]]] = [[], []]
+    snapshot_meta: List[Dict[str, Any]] = []
+
+    for item in request.snapshots:
+        setpoints, saved = load_snapshot_curve(item.snapshot_id)
+        horizon = len(setpoints)
+        snapshot_meta.append({"snapshot_id": item.snapshot_id, "duration": horizon})
+        for zone_index in range(2):
+            zone = saved.zones[zone_index]
+            measurements = item.zones[zone_index]
+            series_readings: List[List[Tuple[int, Fraction]]] = []
+            for series_index, series in enumerate(measurements.series, start=1):
+                label = (
+                    f"快照 #{item.snapshot_id} 温区 {zone_index + 1} 序列 {series_index}"
+                )
+                if not series:
+                    raise CalibrationFailure(
+                        400, "empty_series", f"{label} 为空：每条序列至少需要一个读数。"
+                    )
+                seen: Set[int] = set()
+                readings: List[Tuple[int, Fraction]] = []
+                for reading in series:
+                    if not 1 <= reading.minute <= horizon:
+                        raise CalibrationFailure(
+                            400,
+                            "minute_out_of_range",
+                            f"{label} 的分钟 {reading.minute} 超出范围：分钟限于第 1 分钟至该快照末分钟（第 {horizon} 分钟）。",
+                        )
+                    if reading.minute in seen:
+                        raise CalibrationFailure(
+                            400,
+                            "duplicate_minute",
+                            f"{label} 的分钟 {reading.minute} 重复出现。",
+                        )
+                    seen.add(reading.minute)
+                    readings.append(
+                        (reading.minute, decimal_to_fraction(reading.temperature))
+                    )
+                readings.sort(key=lambda pair: pair[0])
+                series_readings.append(readings)
+            zone_snapshots[zone_index].append(
+                {
+                    "snapshot_id": item.snapshot_id,
+                    "zone_name": zone.name,
+                    "setpoints": setpoints,
+                    "initial": Fraction(zone.initial_temperature),
+                    "series": series_readings,
+                }
+            )
+
+    zones_payload = [
+        calibrate_zone(zone_index, zone_snapshots[zone_index]) for zone_index in range(2)
+    ]
+    identifiable = all(zone["status"] == "unique" for zone in zones_payload)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return {
+        "snapshot_ids": snapshot_ids,
+        "snapshots": snapshot_meta,
+        "identifiable": identifiable,
+        "message": (
+            "两区系数对均唯一，可填回试算表单。"
+            if identifiable
+            else "至少一个温区的最优系数对不唯一（不可辨识），已禁用整次套用。"
+        ),
+        "elapsed_ms": elapsed_ms,
+        "zones": zones_payload,
+    }
+
+
 app = FastAPI(title="双区烘箱曲线试算", version="1.0.0")
 
 
@@ -1521,6 +1840,23 @@ def read_diagnosis(snapshot_id: int) -> Dict[str, Any]:
     diagnosis["snapshot_id"] = snapshot_id
     diagnosis["saved"] = True
     return diagnosis
+
+
+@app.post("/api/calibrate")
+def calibrate(request: CalibrateRequest) -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        return run_calibration(request, started)
+    except CalibrationFailure as failure:
+        raise HTTPException(
+            status_code=failure.status_code,
+            detail={"code": failure.code, "message": failure.message},
+        )
+
+
+@app.get("/calibrate", include_in_schema=False)
+def calibrate_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "calibrate.html")
 
 
 @app.get("/", include_in_schema=False)
