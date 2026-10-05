@@ -12,14 +12,19 @@
       <h1>双区烘箱曲线试算</h1>
       <p>四种响应轨迹联合约束 · 精确有理数递推 · Z3 10 秒限时优化</p>
     </div>
-    <div class="header-actions">
+    <div class="header-actions" id="headerActions">
       <button id="resetBtn" type="button" class="secondary">恢复示例</button>
       <button id="solveBtn" type="button">开始试算</button>
     </div>
   </header>
 
+  <nav class="view-tabs">
+    <button id="solveTab" type="button" class="tab active">曲线试算</button>
+    <button id="calibrationTab" type="button" class="tab">系数校准</button>
+  </nav>
+
   <main class="layout">
-    <section class="panel input-panel">
+    <section class="panel input-panel solve-section">
       <h2>输入参数</h2>
 
       <div class="global-grid">
@@ -44,13 +49,13 @@
       </div>
     </section>
 
-    <aside class="panel snapshot-panel">
+    <aside class="panel snapshot-panel solve-section">
       <h2>快照</h2>
       <p class="muted">每次试算均自动保存，包括无解与超时结果。</p>
       <div id="snapshotList" class="snapshot-list"></div>
     </aside>
 
-    <section id="resultPanel" class="panel result-panel" hidden>
+    <section id="resultPanel" class="panel result-panel solve-section" hidden>
       <div class="result-header">
         <div>
           <h2>试算结果</h2>
@@ -66,10 +71,46 @@
       <div id="diagnosisPanel" class="diagnosis-panel" hidden></div>
       <div id="resultBody"></div>
     </section>
+
+    <section id="calibrationView" class="panel calibration-panel view-hidden">
+      <h2>实测响应系数校准</h2>
+      <p class="muted">
+        选择至少两条“已找到曲线”的不同快照，为每个温区录入两条未标号的分钟末实测温度序列
+        （分钟限第 1 分钟至该快照末分钟，温度为 0～300℃ 的有限十进制数；可跳过部分分钟，每条序列至少一个读数）。
+        服务按各快照<strong>保存的设定曲线与初温</strong>精确递推预测温度（不读取当前表单，也不使用旧系数的展示轨迹），
+        在每区 0.01～1.00、步长 0.01 的系数网格上联合搜索所选快照间共用的系数对与各序列归属，
+        使全部读数的平方误差之和最小（交换两系数视为同一对，误差按精确有理数比较）。
+      </p>
+
+      <div class="cal-section">
+        <div class="section-heading">
+          <h3>1. 选择快照</h3>
+          <span id="calSelectionHint"></span>
+        </div>
+        <div id="calSnapshotList" class="cal-snapshot-list"></div>
+      </div>
+
+      <div class="cal-section">
+        <div class="section-heading">
+          <h3>2. 录入各温区两条实测温度序列（℃）</h3>
+          <span>留空表示该分钟无读数</span>
+        </div>
+        <div id="calEntryList"></div>
+      </div>
+
+      <div class="cal-actions">
+        <button id="calibrateBtn" type="button">开始校准</button>
+        <button id="applyCalBtn" type="button" class="secondary" disabled
+                title="两区系数对均唯一时可用；仅修改当前表单，不改动已保存的快照与诊断">填回表单</button>
+      </div>
+
+      <div id="calResultPanel" class="cal-result"></div>
+    </section>
   </main>
 
   <div id="toast" class="toast" hidden></div>
 
   <script src="/static/app.js"></script>
+  <script src="/static/calibration.js"></script>
 </body>
 </html>

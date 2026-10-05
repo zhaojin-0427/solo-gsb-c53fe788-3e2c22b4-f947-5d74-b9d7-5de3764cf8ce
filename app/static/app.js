@@ -53,11 +53,15 @@ function onReady() {
   els.diagnosisPanel = document.getElementById("diagnosisPanel");
   els.snapshotList = document.getElementById("snapshotList");
   els.toast = document.getElementById("toast");
+  els.solveTab = document.getElementById("solveTab");
+  els.calibrationTab = document.getElementById("calibrationTab");
 
   els.duration.addEventListener("change", renderLockInputs);
   els.solveBtn.addEventListener("click", solve);
   els.diagnoseBtn.addEventListener("click", diagnoseCurrent);
   els.viewDiagnosisBtn.addEventListener("click", viewCurrentDiagnosis);
+  els.solveTab.addEventListener("click", () => switchView("solve"));
+  els.calibrationTab.addEventListener("click", () => switchView("calibration"));
   els.resetBtn.addEventListener("click", () => {
     fillForm(defaults);
     showToast("已恢复示例参数");
@@ -66,6 +70,23 @@ function onReady() {
   renderZones();
   fillForm(defaults);
   loadSnapshots();
+  if (location.hash === "#calibration") switchView("calibration");
+}
+
+// Switch between the trial view and the measured-coefficient calibration
+// view. Solve sections keep their own `hidden` state; the view-level hiding
+// uses a separate class so returning restores them exactly as they were.
+function switchView(view) {
+  const isCalibration = view === "calibration";
+  document.querySelectorAll(".solve-section").forEach((el) => {
+    el.classList.toggle("view-hidden", isCalibration);
+  });
+  document.getElementById("calibrationView").classList.toggle("view-hidden", !isCalibration);
+  document.getElementById("headerActions").classList.toggle("view-hidden", isCalibration);
+  els.solveTab.classList.toggle("active", !isCalibration);
+  els.calibrationTab.classList.toggle("active", isCalibration);
+  history.replaceState(null, "", isCalibration ? "#calibration" : location.pathname);
+  if (isCalibration && typeof refreshCalibration === "function") refreshCalibration();
 }
 
 function renderZones() {

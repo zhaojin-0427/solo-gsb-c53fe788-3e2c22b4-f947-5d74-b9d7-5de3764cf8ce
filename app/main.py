@@ -29,6 +29,8 @@ from z3 import (
     unsat,
 )
 
+from app.calibration import calibrate_joint
+
 getcontext().prec = 100
 
 SOLVE_TIMEOUT_MS = 10_000
@@ -1437,6 +1439,169 @@ def restore_request(request_json: Optional[str]) -> SolveRequest:
         )
 
 
+# ---------- 实测响应系数校准 ----------
+#
+# 校准只读取所选快照保存的设定曲线与初温，按原精确递推重建预测温度，既不
+# 读取页面当前表单，也不使用旧系数的展示轨迹；它不修改任何已保存的快照或
+# 诊断。每区一对系数（0.01～1.00、步长 0.01）在所选快照间共用，交换两系数
+# 视为同一对；每快照每区的两条实测序列未标号、归属可交换。服务联合裁决
+# 系数对与各序列归属，用精确有理数使全部读数的平方误差之和最小——逐条
+# 序列分别拟合再拼接会改变结果，误差比较也绝不先按页面精度舍入。
+
+
+class CalibrationFailure(Exception):
+    """Raised when a calibration request cannot be completed."""
+
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
+class ReadingInput(BaseModel):
+    minute: int
+    temperature: Decimal
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("实测温度必须是有限十进制数")
+        if value < 0 or value > 300:
+            raise ValueError("实测温度必须位于 0 到 300℃ 之间")
+        return value
+
+
+class ZoneMeasurementInput(BaseModel):
+    series: List[List[ReadingInput]] = Field(min_length=2, max_length=2)
+
+
+class SnapshotMeasurementInput(BaseModel):
+    snapshot_id: int
+    zones: List[ZoneMeasurementInput] = Field(min_length=2, max_length=2)
+
+
+class CalibrateRequest(BaseModel):
+    snapshots: List[SnapshotMeasurementInput] = Field(min_length=2)
+
+
+def load_calibration_context(snap: SnapshotMeasurementInput) -> Dict[str, Any]:
+    """Load one selected snapshot's saved curve and validate its series."""
+    record = get_snapshot_record(snap.snapshot_id)
+    if record is None:
+        raise CalibrationFailure(
+            404, "snapshot_not_found", f"快照 #{snap.snapshot_id} 不存在。"
+        )
+    status, request_json = record
+    if not request_json:
+        raise CalibrationFailure(
+            404,
+            "missing_input",
+            f"快照 #{snap.snapshot_id} 缺少保存的输入参数，无法校准。",
+        )
+    try:
+        saved = SolveRequest.model_validate(json.loads(request_json))
+    except (ValueError, ValidationError, TypeError) as exc:
+        raise CalibrationFailure(
+            404,
+            "missing_input",
+            f"快照 #{snap.snapshot_id} 保存的输入参数无法解析：{exc}",
+        )
+
+    result = get_snapshot(snap.snapshot_id) or {}
+    setpoints = result.get("setpoints") or []
+    if status not in ("optimal", "feasible_not_optimal") or len(setpoints) != saved.duration:
+        raise CalibrationFailure(
+            409,
+            "no_curve",
+            f"快照 #{snap.snapshot_id} 没有已找到的设定曲线"
+            f"（状态：{result.get('status_text', status)}），不能用于校准。",
+        )
+
+    # Validate the measured series against this snapshot's horizon: minutes
+    # run from minute 1 to the snapshot's final minute, duplicates are
+    # rejected and every series needs at least one reading.
+    readings: List[List[List[Tuple[int, Fraction]]]] = []
+    for zone_index, zone_measurement in enumerate(snap.zones):
+        zone_name = saved.zones[zone_index].name
+        zone_series: List[List[Tuple[int, Fraction]]] = []
+        for series_index, series in enumerate(zone_measurement.series):
+            label = (
+                f"快照 #{snap.snapshot_id} 温区 {zone_index + 1}"
+                f"（{zone_name}）第 {series_index + 1} 条序列"
+            )
+            if not series:
+                raise CalibrationFailure(
+                    422, "empty_series", f"{label}为空：每条序列至少需要一个读数。"
+                )
+            seen: Set[int] = set()
+            cleaned: List[Tuple[int, Fraction]] = []
+            for reading in series:
+                if not 1 <= reading.minute <= saved.duration:
+                    raise CalibrationFailure(
+                        422,
+                        "minute_out_of_range",
+                        f"{label}中第 {reading.minute} 分钟越界："
+                        f"该快照只允许第 1 至第 {saved.duration} 分钟。",
+                    )
+                if reading.minute in seen:
+                    raise CalibrationFailure(
+                        422, "duplicate_minute", f"{label}中第 {reading.minute} 分钟重复。"
+                    )
+                seen.add(reading.minute)
+                cleaned.append((reading.minute, decimal_to_fraction(reading.temperature)))
+            zone_series.append(sorted(cleaned, key=lambda item: item[0]))
+        readings.append(zone_series)
+
+    return {
+        "snapshot_id": snap.snapshot_id,
+        "status_text": result.get("status_text", status),
+        "duration": saved.duration,
+        "setpoints": setpoints,
+        "zone_names": [zone.name for zone in saved.zones],
+        "initial_temperatures": [zone.initial_temperature for zone in saved.zones],
+        "initials": [Fraction(zone.initial_temperature) for zone in saved.zones],
+        "readings": readings,
+    }
+
+
+def calibrate(request: CalibrateRequest) -> Dict[str, Any]:
+    started = time.perf_counter()
+
+    snapshot_ids = [snap.snapshot_id for snap in request.snapshots]
+    if len(set(snapshot_ids)) != len(snapshot_ids):
+        raise CalibrationFailure(
+            422,
+            "duplicate_snapshot",
+            "所选快照编号重复：校准需要至少两条不同的已找到曲线的快照。",
+        )
+
+    contexts = [load_calibration_context(snap) for snap in request.snapshots]
+    joint = calibrate_joint(contexts)
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return {
+        "elapsed_ms": elapsed_ms,
+        "applicable": joint["applicable"],
+        "snapshots": [
+            {
+                "snapshot_id": ctx["snapshot_id"],
+                "status_text": ctx["status_text"],
+                "duration": ctx["duration"],
+                "setpoints": ctx["setpoints"],
+                "zone_names": ctx["zone_names"],
+                "initial_temperatures": ctx["initial_temperatures"],
+            }
+            for ctx in contexts
+        ],
+        "zones": [
+            {"zone_name": contexts[0]["zone_names"][zone["zone_index"] - 1], **zone}
+            for zone in joint["zones"]
+        ],
+    }
+
+
 app = FastAPI(title="双区烘箱曲线试算", version="1.0.0")
 
 
@@ -1521,6 +1686,17 @@ def read_diagnosis(snapshot_id: int) -> Dict[str, Any]:
     diagnosis["snapshot_id"] = snapshot_id
     diagnosis["saved"] = True
     return diagnosis
+
+
+@app.post("/api/calibrate")
+def create_calibration(request: CalibrateRequest) -> Dict[str, Any]:
+    try:
+        return calibrate(request)
+    except CalibrationFailure as failure:
+        raise HTTPException(
+            status_code=failure.status_code,
+            detail={"code": failure.code, "message": failure.message},
+        )
 
 
 @app.get("/", include_in_schema=False)
